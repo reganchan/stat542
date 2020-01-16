@@ -1,0 +1,263 @@
+---
+title: "Individual Project"
+author: "Fall 2019, by Regan Chan (ttchan2)"
+date: 'Due: Monday, Nov 25 by 11:59 PM Pacific Time'
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+header-includes: \usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+---
+
+
+```{r setup, include=FALSE}
+  knitr::opts_chunk$set(include = TRUE)  # TRUE for solution; FALSE for questions set
+
+  knitr::opts_chunk$set(echo = TRUE)
+  knitr::opts_chunk$set(message = FALSE)
+  knitr::opts_chunk$set(warning = FALSE)
+  knitr::opts_chunk$set(fig.height = 7, fig.width = 8, out.width = '50%', fig.align = "center")
+  options(width = 90)
+```
+
+```{css, echo=FALSE}
+.solution {
+background-color: #e6ffe6;
+}
+```
+
+# Project description and summary
+
+## Wine score analysis and prediction
+
+Given a large amount of wine tasting reviews, is it possible to build a statistical model to estimate an expert
+review score of a bottle given its source winery, country and other parameters?
+
+The problem is not straight forward however. While we are provided with some ready to use parameters like price, 
+region, etc. which are great for running regression on, we cannot ignore that the description field may
+provide the most significant info, yet it's not cleansed or analyzed for us.
+
+In order to extract some useful information out from the description field, without going through the complexities
+of NLP, I will use the `quanteda` library to extract words as tokens, then transform each description into a word
+vector, merge that with the other features provided and feed the resulting vectors to regression algorithms
+
+# Data processing
+
+- There are numerical values such as price and points. They are readily fed to the regression algorithms
+
+## Non-numeric (categorical) values
+
+- There are values like region, winery, etc. Which are more appropriately stored as factors. In order to run regression on them, they are converted to a model matrix in advance
+- Except for "Napa-Sonoma", all region_1s are in a many-to-one cardinality to region_2. Hence region_2 is less precise/descriptive than region_1 so I can be safely discard it; however, region_1 values are often missing from the data, reducing its usefulness.
+- Winery name could not alone identify the winery since it could be in different countries. But winery+country can uniquely identify a winery
+- NA values are either removed or replaced with empty strings because regression algorithms do not work well with NAs.
+- There seems to be a weak correlation between winery, variety and designation. I could not safely remove them without sacrificing accuracy.
+
+## Textual values
+
+- Quanteda provides a complete suite to extract tokens and documents from input data
+- Additional filtering like striping punctuation marks, deleting low frequency terms, and deleting stopwords are also performed
+
+## Duplicate rows
+
+- There are many duplicate rows in the data. They should however not change the outcome of the regression
+
+```{r echo=TRUE, message=TRUE, include=FALSE, cache=TRUE}
+library(knitr)
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE, cache.lazy = FALSE)
+library(magrittr)
+
+setwd("~/prj")
+assert_libraries <- function(libraries) {
+  libraries <- strsplit(libraries, ";")[[1]]
+  assertthat::assert_that(all(libraries %in% installed.packages()[,1]))
+}
+assert_libraries("dplyr;functional;jsonlite;textclean;glmnet;quanteda;xgboost;DiagrammeR;webshot")
+
+replaceNA <- function(v) {
+  replace(v, is.na(v), "")
+}
+
+load_json_data <- function(file_name, ...) {
+  json <- jsonlite::read_json(file_name, simplifyVector = TRUE) 
+  to_factor <- functional::Compose(as.character, replaceNA, as.factor)
+  col_func <- c(as.numeric, as.character, log, rep(c(to_factor), 7))
+  for(colnum in 1:ncol(json)) {
+    json[, colnum] <- col_func[[colnum]]( json[, colnum] )
+  }
+  
+  return(na.omit(json[, c(1:5, 9:10)], ...))
+}
+
+json <- load_json_data("winemag-data_first150k.json")
+```
+
+# Descriptive statistics
+
+Here I am hoping that there are some obvious correlations in the data that can help with regression
+```{r pricePoint, include=TRUE, echo=FALSE}
+plot(json$price, json$points, main="Points/Log(Price)", xlab="Log(price)", ylab="Points")
+```
+The first thing that came to mind is, does price dictate the quality of the wine? While it is true from this plot that higher price does roughly translate to higher scores, most of the wine is centered around a low price point and they still get very good scores.
+
+Another observation is that, a linear regression on this relationship should be very doable
+
+```{r priceHist, include=TRUE, echo=FALSE}
+hist(json$price, main="Distribution of prices", xlab="Log(Price)")
+```
+Wines can be cheap or the sky is the limit! A significant portion of wines are at very low price point, though. Having taken a logarithm on the price may help model it better. The logarithm of the prices seem to be normally distributed
+
+```{r reviewHist, include=TRUE, echo=FALSE}
+hist(json$points, main="Distribution of review points")
+```
+The points appears to be normally distributed around 87. The wine reviewers tend to give pretty good scores to all wines. Or maybe wine is wine, they all taste the same. Because of this, a gaussian model should give a good estimate.
+
+```{r termFreq, include=FALSE, cache=TRUE, echo=TRUE}
+library(magrittr)
+stop_words <- c(quanteda::stopwords("en"), names(json))
+
+data.dfm <- quanteda::corpus(json, text_field="description") %>%
+  quanteda::dfm(remove=stop_words, remove_punct=TRUE, verbose=TRUE) %>%
+  quanteda::dfm_trim()
+```
+```{r termFreqPlots, include=TRUE, echo=FALSE}
+most_freq_terms <- sort(quanteda::colSums(data.dfm), decreasing=T)[1:20]
+barplot(most_freq_terms, las=2, main="20 Most frequent terms in descriptions")
+```
+The most frequently occurring terms like "wine", "flavours" seems to be very generic and hence meaningless in our context. I filtered them away with max_termfreq.
+
+# Regression model analysis
+```{r trainSplit, include=FALSE, echo=TRUE}
+n <- nrow(json)
+set.seed(0)
+rows.train <- sample(1:n, n * 0.9)
+```
+```{r trainData, include=FALSE, cache=TRUE}
+generate_design_matrix <- function(rows) {
+  Matrix::sparse.model.matrix(~price+designation+variety+country+winery, rows)
+}
+
+generate_model_data <- function(rows) {
+  vars <- generate_design_matrix(rows)
+  dfm  <- rows$description %>%
+    quanteda::tokens(remove_numbers=TRUE, remove_punct=TRUE, remove_separators=TRUE) %>%
+    quanteda::tokens_remove(stop_words) %>%
+    quanteda::dfm(verbose=TRUE) %>%
+    quanteda::dfm_trim(max_termfreq=40000) %>%
+    quanteda::as.DocumentTermMatrix()
+  
+  dtm <- Matrix::sparseMatrix(i=dfm$i, j=dfm$j, x=dfm$v)
+  colnames(dtm) <- colnames(dfm)
+  x <- cbind(vars, dtm)
+  y <- rows$points
+  return(list(x=x, y=y))
+}
+
+model_data <- generate_model_data(json)
+train.x <- model_data$x[rows.train,]
+train.y <- model_data$y[rows.train]
+test.x <- model_data$x[-rows.train,]
+test.y <- model_data$y[-rows.train]
+```
+## Generalized linear model with Lasso penalty
+
+The generated training matrix has 87953 features. Lasso regularization with CV will reduce that number
+to something more manageable.
+
+```{r glmnet, include=TRUE, cache=TRUE, echo=FALSE}
+glmnet_cv <- glmnet::cv.glmnet(x=train.x, y=train.y, family='gaussian', alpha=1)
+plot(glmnet_cv)
+```
+
+This 1se model will consider a staggering 44014 words/parameters, roughly half of the total 87953 parameters!
+```{r glmnetPlot, include=TRUE, cache=TRUE, echo=FALSE}
+glmnet_model <- glmnet::glmnet(x=train.x, y=train.y, family='gaussian', alpha=1, lambda=glmnet_cv$lambda.1se)
+model_coef <- coef(glmnet_model)
+top_coef_indices <- tail(order(abs(model_coef)), 21)[1:20]
+top_coef <- model_coef[top_coef_indices]
+names(top_coef) <- model_coef@Dimnames[[1]][top_coef_indices]
+par(mar=c(15,4,4,2)+0.1)
+barplot(top_coef, las=2, main="Most significant parameters", ylab="Point delta")
+```
+The winery "Château les Tonnelles" produces great wines, with a score 7.7 above average. Similarly, A designation of "Sorella Red Wine" or a description containing "tongue-singeing" also raises the score by 5.7 and 5.36 respectively.
+On the contrary, a designation of "Tianquaic Vineyard" lowers the score by 8; winery "Contador" and "Terra Jovia" are pretty bad, they got minus average scores of -7 and  -5 respectively. Having "cough-syrup" in the description also is a very bad sign, subtracting -6 from the score.
+A designation of "Colheita White" also mean a -15 score.
+
+Model accuracy:
+```{r glmnetError, include=TRUE, cache=TRUE, echo=FALSE}
+rmse <- function(model, x, y) {
+  sqrt(mean((predict(model, x)-y)^2))
+}
+paste("Training RMSE: ", rmse(glmnet_model, train.x, train.y))
+paste("Test RMSE: ", rmse(glmnet_model, test.x, test.y))
+```
+
+## Random forest model with xgboost
+
+A decision tree based model will give more insights as to what determines the wine scores.
+
+```{r treeModel, include=FALSE, cache=TRUE, echo=FALSE}
+tree_model <- xgboost::xgboost(data=train.x, label=train.y, maxdepth=10, eta=0.5, nthread=8, nrounds=1000)
+```
+```{r treePlot, include=TRUE, cache=TRUE, echo=FALSE}
+importance <- xgboost::xgb.importance(feature_names=colnames(train.x), model=tree_model)
+xgboost::xgb.plot.importance(importance_matrix=head(importance, 20), main="20 most important params")
+```
+Now the random forest has spoken. Price most clearly declares winners and losers. That's not a surprise as we saw in a previous plot: While a good wine isn't necessary expensive, expensive wines are definitely good!
+Other than that, whether or not the word "rich" was mentioned in the description also matters.
+Obviously, whether it came from the US also was a major decision point.
+
+Model accuracy:
+```{r treeError, include=TRUE, cache=TRUE, echo=FALSE}
+paste("Training RMSE: ", rmse(tree_model, train.x, train.y))
+paste("Test RMSE: ", rmse(tree_model, test.x, test.y))
+```
+The random forest model does slightly worse than the glmnet model but still rougly equivalent. Surprisingly, their decisions are based on totally different parameters!
+
+```{r treeDiagram, include=FALSE, cache=TRUE, echo=FALSE}
+# The randomForest is very deep, but this is a glimpse of how the scores can be estimated.
+
+xgboost::xgb.plot.tree(model=tree_model, trees=1, show_node_id=TRUE)
+```
+
+# Recommend wineries for fruity pinot noir
+
+Since we know in advance the customer is interested in just one variety of wine (Pinot Noir), we can disregard any wineries that:
+1) do not sell this type of wine, or
+2) their price does not fit customer's budget
+
+Now let's use our regression models to predict the scores of a "Pinot Noir" with "Fruity taste" in the description among those wineries with matches:
+
+```{r topPinotNoirWineries, include=TRUE, echo=FALSE, cache=TRUE}
+subset_json <- json[json$variety=="Pinot Noir" & json$price < 20, ]
+subset_model <- subset_json %>%
+  dplyr::mutate(description = "fruit fruity taste") %>%
+  rbind(json, .) %>%
+  generate_model_data()
+
+subset_indices <- (n+1):(n+nrow(subset_json))
+subset.x <- subset_model$x[subset_indices,]
+
+subset_scores <- data.frame(glmnet=predict(glmnet_model, subset.x), tree=predict(tree_model, subset.x))
+subset_result <- cbind(subset_json$winery, subset_scores)
+colnames(subset_result) <- c("winery", "glmnet", "tree")
+
+subset_grouped <- subset_result %>%
+  dplyr::group_by(winery) %>%
+  dplyr::summarize(glmnet=mean(glmnet), tree=mean(tree))
+
+top_indices <- head(order(subset_grouped$glmnet + subset_grouped$tree, decreasing=TRUE), 10)
+```
+```{r topPinotNoirWineriesTable, include=TRUE, echo=FALSE}
+knitr::kable(subset_grouped[top_indices,], format="markdown", caption="Top Pinot Noir wineries")
+```
+
+According to our prediction models, the top choices for a "fruity taste" Pinot Noir are in the above table, along with their expected scores.
+
+If we look at the underlying data, however, Shingle Peak, Stadlmann, Tangley Oaks, Alta Maria and Fiddlehead should have been our pick for the best wineries. We can get that if we don't replace the description in our test model.
+
+However, if we assume that the customer is mostly interested in a fruity taste, basically ignoring all the other text in the description, then we get Clos de Tart, Domaine Bruno Clair, Domaine Perrot-Minot, Domaine Méo-Camuzet and Domaine Jean Grivot as our top picks for wineries.
